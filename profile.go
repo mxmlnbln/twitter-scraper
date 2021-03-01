@@ -3,11 +3,7 @@ package twitterscraper
 import (
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 	"time"
-
-	"github.com/PuerkitoBio/goquery"
 )
 
 // Profile of twitter user.
@@ -18,12 +14,15 @@ type Profile struct {
 	Birthday       string
 	FollowersCount int
 	FollowingCount int
+	FriendsCount   int
 	IsPrivate      bool
 	IsVerified     bool
 	Joined         *time.Time
 	LikesCount     int
+	ListedCount    int
 	Location       string
 	Name           string
+	PinnedTweetIDs []string
 	TweetsCount    int
 	URL            string
 	UserID         string
@@ -32,55 +31,83 @@ type Profile struct {
 }
 
 // GetProfile return parsed user profile.
-func GetProfile(username string) (Profile, error) {
-	url := "https://mobile.twitter.com/" + username
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return Profile{}, err
-	}
-	req.Header.Set("Accept-Language", "en-US")
-
-	resp, err := http.DefaultClient.Do(req)
-	if resp == nil {
-		return Profile{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return Profile{}, fmt.Errorf("response status: %s", resp.Status)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+func (s *Scraper) GetProfile(username string) (Profile, error) {
+	var jsn user
+	req, err := http.NewRequest("GET", "https://api.twitter.com/graphql/4S2ihIKfF3xhp-ENxvUAfQ/UserByScreenName?variables=%7B%22screen_name%22%3A%22"+username+"%22%2C%22withHighlightedLabel%22%3Atrue%7D", nil)
 	if err != nil {
 		return Profile{}, err
 	}
 
-	// parse join date text
-	screenName := doc.Find(".screen-name").First().Text()
+	err = s.RequestAPI(req, &jsn)
+	if err != nil {
+		return Profile{}, err
+	}
 
-	// check is username valid
-	if screenName == "" {
+	if len(jsn.Errors) > 0 {
+		return Profile{}, fmt.Errorf("%s", jsn.Errors[0].Message)
+	}
+
+	if jsn.Data.User.RestID == "" {
+		return Profile{}, fmt.Errorf("rest_id not found")
+	}
+
+	if jsn.Data.User.Legacy.ScreenName == "" {
 		return Profile{}, fmt.Errorf("either @%s does not exist or is private", username)
 	}
 
-	return Profile{
-		Avatar:         doc.Find("td.avatar > img").First().AttrOr("src", ""),
-		Biography:      strings.TrimSpace(doc.Find(".bio").First().Text()),
-		FollowersCount: parseCount(doc.Find("table.profile-stats > tbody > tr > td:nth-child(3) > a > div.statnum").First().Text()),
-		FollowingCount: parseCount(doc.Find("table.profile-stats > tbody > tr > td:nth-child(2) > a > div.statnum").First().Text()),
-		IsPrivate:      strings.Contains(doc.Find("div.fullname > a.badge > img").First().AttrOr("src", ""), "protected"),
-		IsVerified:     strings.Contains(doc.Find("div.fullname > a.badge > img").First().AttrOr("src", ""), "verified"),
-		Location:       strings.TrimSpace(doc.Find(".location").First().Text()),
-		Name:           strings.TrimSpace(doc.Find(".fullname").First().Text()),
-		TweetsCount:    parseCount(doc.Find("table.profile-stats > tbody > tr > td:nth-child(1) > div.statnum").First().Text()),
-		URL:            "https://twitter.com/" + screenName,
-		Username:       screenName,
-		Website:        strings.TrimSpace(doc.Find("div.url > div > a").First().AttrOr("data-url", "")),
-	}, nil
+	user := jsn.Data.User.Legacy
+
+	profile := Profile{
+		Avatar:         user.ProfileImageURLHTTPS,
+		Banner:         user.ProfileBannerURL,
+		Biography:      user.Description,
+		FollowersCount: user.FollowersCount,
+		FollowingCount: user.FavouritesCount,
+		FriendsCount:   user.FriendsCount,
+		IsPrivate:      user.Protected,
+		IsVerified:     user.Verified,
+		LikesCount:     user.FavouritesCount,
+		ListedCount:    user.ListedCount,
+		Location:       user.Location,
+		Name:           user.Name,
+		PinnedTweetIDs: user.PinnedTweetIdsStr,
+		TweetsCount:    user.StatusesCount,
+		URL:            "https://twitter.com/" + user.ScreenName,
+		UserID:         jsn.Data.User.RestID,
+		Username:       user.ScreenName,
+	}
+
+	tm, err := time.Parse(time.RubyDate, user.CreatedAt)
+	if err == nil {
+		tm = tm.UTC()
+		profile.Joined = &tm
+	}
+
+	if len(user.Entities.URL.Urls) > 0 {
+		profile.Website = user.Entities.URL.Urls[0].ExpandedURL
+	}
+
+	return profile, nil
 }
 
-func parseCount(str string) (i int) {
-	i, _ = strconv.Atoi(strings.Replace(str, ",", "", -1))
-	return
+// GetProfile wrapper for default scraper
+func GetProfile(username string) (Profile, error) {
+	return defaultScraper.GetProfile(username)
+}
+
+// GetUserIDByScreenName from API
+func (s *Scraper) GetUserIDByScreenName(screenName string) (string, error) {
+	id, ok := cacheIDs.Load(screenName)
+	if ok {
+		return id.(string), nil
+	}
+
+	profile, err := s.GetProfile(screenName)
+	if err != nil {
+		return "", err
+	}
+
+	cacheIDs.Store(screenName, profile.UserID)
+
+	return profile.UserID, nil
 }
